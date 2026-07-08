@@ -1,0 +1,200 @@
+name: release-go (reusable)
+
+# Reusable release pipeline for pure-Go, cross-compiled binaries.
+# Shape: semver-bump (git-cliff) -> build matrix -> GitHub release.
+# Homebrew / Chocolatey publishing stays in the CALLER as a small local job
+# (formula name, dispatch payload, and target repo are repo-specific), gated on
+# the `is-release` / `version` outputs this workflow exposes.
+#
+# The caller decides the trigger semantics:
+#   push to main        -> mode: beta   (auto)  -> X.Y.Z-beta.<run#> prerelease, no publish
+#   push semver tag      -> mode: release (auto) -> full release, caller publishes
+#   workflow_dispatch    -> pass mode + dry-run explicitly to test either path safely
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: 'auto | beta | release'
+        type: string
+        default: auto
+      dry-run:
+        description: 'true => compute + build only; no tag push, no release, no publish'
+        type: boolean
+        default: false
+      go-version:
+        type: string
+        default: '1.23'
+      binary-name:
+        description: 'Installed binary name placed inside the archive (az, jt, editorlint).'
+        type: string
+        required: true
+      cmd-path:
+        description: 'go build target (./cmd/az/main.go, ., cmd/editorlint/main.go).'
+        type: string
+        required: true
+      version-pkg:
+        description: 'Package path for -X <pkg>.version/.commit/.date injection. Empty => skip injection.'
+        type: string
+        default: 'main'
+      extra-ldflags:
+        description: 'Additional ldflags (e.g. "-s -w").'
+        type: string
+        default: ''
+      build-matrix:
+        description: 'JSON array of {goos, goarch} objects.'
+        type: string
+        required: true
+      asset-name-template:
+        description: 'Archive base name with {version} {goos} {goarch} placeholders (no extension).'
+        type: string
+        required: true
+      changelog-config:
+        description: 'git-cliff render config for release notes.'
+        type: string
+        default: '.cliff.toml'
+      tag-match:
+        description: 'git describe --match glob for the last final release tag (passed through to semver-bump via config; informational).'
+        type: string
+        default: '[0-9]*'
+    secrets:
+      app-id:
+        required: false
+      app-pem:
+        required: false
+    outputs:
+      version:
+        value: ${{ jobs.version.outputs.version }}
+      changed:
+        value: ${{ jobs.version.outputs.changed }}
+      is_beta:
+        value: ${{ jobs.version.outputs.is_beta }}
+      is_release:
+        value: ${{ jobs.version.outputs.is_release }}
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      changed: ${{ steps.bump.outputs.changed }}
+      is_beta: ${{ steps.bump.outputs.is_beta }}
+      is_release: ${{ steps.bump.outputs.is_release }}
+    steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-pem }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Resolve version
+        id: bump
+        uses: dobbo-ca/.github/actions/semver-bump@v1
+        with:
+          mode: ${{ inputs.mode }}
+          dry-run: ${{ inputs.dry-run }}
+
+  build:
+    needs: version
+    if: needs.version.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include: ${{ fromJSON(inputs.build-matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: git fetch --tags --force
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: false
+
+      - name: Build + archive
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ needs.version.outputs.version }}
+          BIN: ${{ inputs.binary-name }}
+          CMD: ${{ inputs.cmd-path }}
+          VPKG: ${{ inputs.version-pkg }}
+          EXTRA_LDFLAGS: ${{ inputs.extra-ldflags }}
+          NAME_TMPL: ${{ inputs.asset-name-template }}
+        run: |
+          set -euo pipefail
+          ldflags="${EXTRA_LDFLAGS}"
+          if [ -n "$VPKG" ]; then
+            ldflags="$ldflags -X ${VPKG}.version=${VERSION} -X ${VPKG}.commit=${GITHUB_SHA} -X ${VPKG}.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          fi
+
+          out="$BIN"
+          [ "$GOOS" = windows ] && out="${BIN}.exe"
+          go build -ldflags "$ldflags" -o "$out" "$CMD"
+
+          base="${NAME_TMPL//\{version\}/$VERSION}"
+          base="${base//\{goos\}/$GOOS}"
+          base="${base//\{goarch\}/$GOARCH}"
+
+          if [ "$GOOS" = windows ]; then
+            archive="${base}.zip"
+            zip "$archive" "$out"
+          else
+            archive="${base}.tar.gz"
+            tar czf "$archive" "$out"
+          fi
+          shasum -a 256 "$archive" | awk '{print $1}' > "${archive}.sha256"
+          echo "built $archive"; cat "${archive}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+            *.zip
+            *.zip.sha256
+
+  release:
+    needs: [version, build]
+    if: needs.version.outputs.changed == 'true' && inputs.dry-run == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: git fetch --tags --force
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff@2.13.1
+      - name: Generate release notes
+        run: git cliff --config "${{ inputs.changelog-config }}" --latest --strip header -o RELEASE_NOTES.md || echo "(no notes)" > RELEASE_NOTES.md
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} release-assets/ \;
+          ls -lh release-assets/
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.version }}
+          name: ${{ needs.version.outputs.version }}
+          body_path: RELEASE_NOTES.md
+          prerelease: ${{ needs.version.outputs.is_beta == 'true' }}
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
