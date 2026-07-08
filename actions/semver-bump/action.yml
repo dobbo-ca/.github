@@ -81,6 +81,19 @@ runs:
           emit "" false false false
           exit 0
         fi
+        # Guard against a non-increasing bump. git-cliff can return a version LOWER than
+        # $before when $before's tag sits on a skip-typed commit (docs/ci/... -> git-cliff
+        # doesn't recognize it as a release) or is unreachable from HEAD. String inequality
+        # alone would mistake that for a release and cut a downgrade / collide on an existing
+        # tag. Only proceed when $next is strictly semver-greater than $before.
+        if [ -n "$before" ]; then
+          higher="$(printf '%s\n%s\n' "$before" "$next" | sort -V | tail -n1)"
+          if [ "$higher" != "$next" ]; then
+            echo "next ($next) not greater than last-final ($before) — no release"
+            emit "" false false false
+            exit 0
+          fi
+        fi
 
         if [ "$mode" = beta ]; then
           version="${next}-beta.${GITHUB_RUN_NUMBER}"
