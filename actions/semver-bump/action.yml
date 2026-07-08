@@ -1,0 +1,104 @@
+name: semver-bump
+description: >
+  Conventional-commit version resolution with git-cliff (pinned 2.13.1). Computes
+  the next final semver (prerelease tags ignored as the bump base) and, depending
+  on mode, emits a beta prerelease version, a real release version, or creates the
+  release tag. The caller MUST checkout with fetch-depth: 0 and a token that can
+  push tags (annotated-tag push uses the checkout credentials).
+inputs:
+  mode:
+    description: 'auto | beta | release | release-on-merge. auto => tag ref => release, else beta.'
+    default: auto
+  config:
+    description: 'git-cliff bump-gate config path (.cliff-bump.toml).'
+    default: .cliff-bump.toml
+  dry-run:
+    description: 'true => compute only, never create or push a tag.'
+    default: 'false'
+outputs:
+  version:
+    description: 'Resolved version. beta => X.Y.Z-beta.N ; release => the pushed tag ; release-on-merge => X.Y.Z. Empty when nothing to release.'
+    value: ${{ steps.r.outputs.version }}
+  changed:
+    description: 'true when a release/beta should proceed.'
+    value: ${{ steps.r.outputs.changed }}
+  is_beta:
+    description: 'true for a beta prerelease.'
+    value: ${{ steps.r.outputs.is_beta }}
+  is_release:
+    description: 'true for a real (non-prerelease) release.'
+    value: ${{ steps.r.outputs.is_release }}
+runs:
+  using: composite
+  steps:
+    - name: Install git-cliff
+      uses: taiki-e/install-action@v2
+      with:
+        tool: git-cliff@2.13.1
+    - name: Resolve version
+      id: r
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        CONFIG: ${{ inputs.config }}
+        DRY_RUN: ${{ inputs.dry-run }}
+      run: |
+        set -euo pipefail
+
+        mode="$MODE"
+        if [ "$mode" = auto ]; then
+          case "${GITHUB_REF:-}" in
+            refs/tags/*) mode=release ;;
+            *)           mode=beta ;;
+          esac
+        fi
+
+        emit() { # $1 version  $2 changed  $3 is_beta  $4 is_release
+          {
+            echo "version=$1"
+            echo "changed=$2"
+            echo "is_beta=$3"
+            echo "is_release=$4"
+          } >> "$GITHUB_OUTPUT"
+          echo "semver-bump: mode=$mode version='$1' changed=$2 beta=$3 release=$4"
+        }
+
+        # release: the human-pushed tag IS the version; nothing to compute or push.
+        if [ "$mode" = release ]; then
+          emit "${GITHUB_REF#refs/tags/}" true false true
+          exit 0
+        fi
+
+        # beta / release-on-merge: compute next FINAL version.
+        # tag_pattern in $CONFIG excludes prerelease tags, so betas never become the base.
+        # 'before' = highest existing FINAL tag (prefix-agnostic; ignores X.Y.Z-beta.N
+        # prereleases and moving major aliases like v0/v1). Empty on a repo with none.
+        before="$(git tag --list --sort=-v:refname | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
+        next="$(git cliff --config "$CONFIG" --bumped-version 2>/dev/null || echo '')"
+        echo "last-final='$before' next='$next'"
+
+        if [ -z "$next" ] || [ "$next" = "$before" ]; then
+          emit "" false false false
+          exit 0
+        fi
+
+        if [ "$mode" = beta ]; then
+          version="${next}-beta.${GITHUB_RUN_NUMBER}"
+          is_beta=true;  is_release=false
+        else
+          version="$next"                 # release-on-merge
+          is_beta=false; is_release=true
+        fi
+
+        if [ "$DRY_RUN" = true ]; then
+          echo "dry-run: would create tag $version"
+          emit "$version" true "$is_beta" "$is_release"
+          exit 0
+        fi
+
+        # Annotated tags require a committer identity (github-actions[bot]).
+        git config user.name  'github-actions[bot]'
+        git config user.email 'github-actions[bot]@users.noreply.github.com'
+        git tag -a "$version" -m "$version"
+        git push origin "refs/tags/$version"
+        emit "$version" true "$is_beta" "$is_release"
