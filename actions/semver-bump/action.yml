@@ -109,6 +109,17 @@ runs:
           exit 0
         fi
 
+        # Idempotency: 'Re-run all jobs' / 'Re-run failed jobs' keeps the same
+        # GITHUB_RUN_NUMBER, so a re-run recomputes an identical $version. If that
+        # tag already exists on the remote, don't recreate/repush it — 'git tag'
+        # would abort (tag exists) or the push would be non-ff rejected, failing
+        # the re-run under set -e. Reuse the existing tag and emit the version.
+        if git ls-remote --exit-code --tags origin "refs/tags/$version" >/dev/null 2>&1; then
+          echo "tag $version already exists on remote — reusing (idempotent re-run)"
+          emit "$version" true "$is_beta" "$is_release"
+          exit 0
+        fi
+
         # Annotated tags require a committer identity (github-actions[bot]).
         git config user.name  'github-actions[bot]'
         git config user.email 'github-actions[bot]@users.noreply.github.com'
