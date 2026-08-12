@@ -15,6 +15,12 @@ inputs:
   dry-run:
     description: 'true => compute only, never create or push a tag.'
     default: 'false'
+  tag-prefix:
+    description: 'Literal text before the semver in a tag, e.g. "chart/v" => chart/v0.2.0. Empty (default) => unprefixed tags.'
+    default: ''
+  include-path:
+    description: 'Glob passed to git-cliff --include-path; only commits touching it bump. Empty (default) => all paths.'
+    default: ''
 outputs:
   version:
     description: 'Resolved version. beta => X.Y.Z-beta.N ; release => the pushed tag ; release-on-merge => X.Y.Z. Empty when nothing to release.'
@@ -22,6 +28,9 @@ outputs:
   changed:
     description: 'true when a release/beta should proceed.'
     value: ${{ steps.r.outputs.changed }}
+  tag:
+    description: 'Full git tag: <tag-prefix><version>. Equals version when tag-prefix is empty. Empty when nothing to release.'
+    value: ${{ steps.r.outputs.tag }}
   is_beta:
     description: 'true for a beta prerelease.'
     value: ${{ steps.r.outputs.is_beta }}
@@ -42,6 +51,8 @@ runs:
         MODE: ${{ inputs.mode }}
         CONFIG: ${{ inputs.config }}
         DRY_RUN: ${{ inputs.dry-run }}
+        PREFIX: ${{ inputs.tag-prefix }}
+        INCLUDE_PATH: ${{ inputs.include-path }}
       run: |
         set -euo pipefail
 
@@ -54,27 +65,44 @@ runs:
         fi
 
         emit() { # $1 version  $2 changed  $3 is_beta  $4 is_release
+          local tag="${1:+${PREFIX}$1}"
           {
             echo "version=$1"
+            echo "tag=$tag"
             echo "changed=$2"
             echo "is_beta=$3"
             echo "is_release=$4"
           } >> "$GITHUB_OUTPUT"
-          echo "semver-bump: mode=$mode version='$1' changed=$2 beta=$3 release=$4"
+          echo "semver-bump: mode=$mode version='$1' tag='$tag' changed=$2 beta=$3 release=$4"
         }
 
         # release: the human-pushed tag IS the version; nothing to compute or push.
+        # $PREFIX is stripped so 'version' stays bare and 'tag' keeps the full ref.
         if [ "$mode" = release ]; then
-          emit "${GITHUB_REF#refs/tags/}" true false true
+          ref_tag="${GITHUB_REF#refs/tags/}"
+          emit "${ref_tag#"$PREFIX"}" true false true
           exit 0
         fi
 
         # beta / release-on-merge: compute next FINAL version.
         # tag_pattern in $CONFIG excludes prerelease tags, so betas never become the base.
-        # 'before' = highest existing FINAL tag (prefix-agnostic; ignores X.Y.Z-beta.N
-        # prereleases and moving major aliases like v0/v1). Empty on a repo with none.
-        before="$(git tag --list --sort=-v:refname | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
-        next="$(git cliff --config "$CONFIG" --bumped-version 2>/dev/null || echo '')"
+        # 'before' = highest existing FINAL tag carrying $PREFIX (ignores X.Y.Z-beta.N
+        # prereleases, moving major aliases like v0/v1, and the other version line's
+        # prefix). Empty on a repo with none. $PREFIX must be regex-literal.
+        # git-cliff echoes the matched tag verbatim from --bumped-version, so $next
+        # is prefixed too and compares/sorts against $before as-is.
+        before="$(git tag --list --sort=-v:refname | grep -E "^${PREFIX}v?[0-9]+\.[0-9]+\.[0-9]+$" | head -n1 || true)"
+        # --unreleased is required, not optional: without it, a release commit
+        # that lands outside its own include_paths makes its own tag invisible
+        # to the path filter, git-cliff rebases off the PRIOR tag, and recomputes
+        # a version that's <= one that already exists. Verified strictly safer —
+        # it still honours tag_pattern and still returns the initial_tag on a
+        # zero-tag repo. See the git-cliff-two-lines verified-assumption notes.
+        cliff_args=(--config "$CONFIG" --unreleased)
+        if [ -n "$INCLUDE_PATH" ]; then
+          cliff_args+=(--include-path "$INCLUDE_PATH")
+        fi
+        next="$(git cliff "${cliff_args[@]}" --bumped-version 2>/dev/null || echo '')"
         echo "last-final='$before' next='$next'"
 
         if [ -z "$next" ] || [ "$next" = "$before" ]; then
@@ -95,16 +123,18 @@ runs:
           fi
         fi
 
+        bare="${next#"$PREFIX"}"
         if [ "$mode" = beta ]; then
-          version="${next}-beta.${GITHUB_RUN_NUMBER}"
+          version="${bare}-beta.${GITHUB_RUN_NUMBER}"
           is_beta=true;  is_release=false
         else
-          version="$next"                 # release-on-merge
+          version="$bare"                 # release-on-merge
           is_beta=false; is_release=true
         fi
+        tag="${PREFIX}${version}"
 
         if [ "$DRY_RUN" = true ]; then
-          echo "dry-run: would create tag $version"
+          echo "dry-run: would create tag $tag"
           emit "$version" true "$is_beta" "$is_release"
           exit 0
         fi
@@ -114,8 +144,8 @@ runs:
         # tag already exists on the remote, don't recreate/repush it — 'git tag'
         # would abort (tag exists) or the push would be non-ff rejected, failing
         # the re-run under set -e. Reuse the existing tag and emit the version.
-        if git ls-remote --exit-code --tags origin "refs/tags/$version" >/dev/null 2>&1; then
-          echo "tag $version already exists on remote — reusing (idempotent re-run)"
+        if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+          echo "tag $tag already exists on remote — reusing (idempotent re-run)"
           emit "$version" true "$is_beta" "$is_release"
           exit 0
         fi
@@ -123,6 +153,6 @@ runs:
         # Annotated tags require a committer identity (github-actions[bot]).
         git config user.name  'github-actions[bot]'
         git config user.email 'github-actions[bot]@users.noreply.github.com'
-        git tag -a "$version" -m "$version"
-        git push origin "refs/tags/$version"
+        git tag -a "$tag" -m "$tag"
+        git push origin "refs/tags/$tag"
         emit "$version" true "$is_beta" "$is_release"
