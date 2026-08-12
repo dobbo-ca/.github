@@ -102,8 +102,19 @@ runs:
           "${{ inputs.context }}"
 
         if [ "${{ inputs.push }}" = "true" ]; then
-          first_tag="${{ inputs.registry }}/${{ inputs.image }}:$(echo "${{ inputs.tags }}" | head -n1)"
-          digest="$(docker buildx imagetools inspect "$first_tag" --format '{{json .Manifest}}' | grep -o '"digest":"[^"]*"' | head -n1 | cut -d'"' -f4)"
+          # No "grep | head" here. Under `set -o pipefail`, head exits after the
+          # first line, grep takes SIGPIPE, and the pipeline returns 141 — which
+          # fails the step AFTER the image has already been pushed successfully.
+          # Read the whole document, then extract without a pipeline.
+          # tag_flags is ("-t" "<ref>" "-t" "<ref>" ...), so [1] is the first ref,
+          # already fully qualified. Do not re-split it on ":" — a registry with
+          # a port would break that.
+          first_tag="${tag_flags[1]:-}"
+          manifest=""
+          [ -n "$first_tag" ] && manifest="$(docker buildx imagetools inspect "$first_tag" --format '{{json .Manifest}}' || true)"
+          digest="$(printf '%s' "$manifest" | jq -r '.digest // empty' 2>/dev/null || true)"
+          # A missing digest is not a build failure; the push already succeeded.
+          [ -n "$digest" ] || echo "warning: could not read a digest for $first_tag" >&2
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
         else
           echo "digest=" >> "$GITHUB_OUTPUT"
