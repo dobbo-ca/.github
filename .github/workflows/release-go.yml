@@ -179,7 +179,33 @@ jobs:
         with:
           tool: git-cliff@2.13.1
       - name: Generate release notes
-        run: git cliff --config "${{ inputs.changelog-config }}" --latest --strip header -o RELEASE_NOTES.md || echo "(no notes)" > RELEASE_NOTES.md
+        env:
+          CONFIG: ${{ inputs.changelog-config }}
+          VERSION: ${{ needs.version.outputs.version }}
+          IS_BETA: ${{ needs.version.outputs.is_beta }}
+        run: |
+          set -euo pipefail
+          # --latest spans from the previous tag of ANY kind. On a final release
+          # that is the newest beta, so the notes list only what landed after it
+          # and silently drop every commit already shipped in a prerelease. A
+          # final release has to describe everything since the last FINAL tag.
+          range=(--latest)
+          if [ "$IS_BETA" != "true" ]; then
+            # Match final tags positively: X.Y.Z with an optional leading v.
+            # Anything carrying a prerelease suffix is not a release boundary.
+            prev="$(git tag --list --sort=-v:refname \
+                    | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+                    | grep -vFx -- "$VERSION" \
+                    | head -n1 || true)"
+            # No prior final tag means this is the first release: --latest is
+            # already the whole history.
+            # Written as an if, not `[ ... ] && ...`: under `set -e` a false
+            # test at the head of an AND-list exits the step.
+            if [ -n "$prev" ]; then range=("$prev..HEAD"); fi
+          fi
+          echo "notes range: ${range[*]}"
+          git cliff --config "$CONFIG" "${range[@]}" --strip header -o RELEASE_NOTES.md \
+            || echo "(no notes)" > RELEASE_NOTES.md
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
